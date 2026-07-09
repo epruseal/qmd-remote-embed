@@ -1,20 +1,33 @@
 /**
  * store-cjk-fts.test.ts — Regression tests for the CJK FTS migration fix.
  *
- * Covers rebuildFTSForCjkNormalization()'s streaming, batched, shadow-table
- * rebuild (src/store.ts). The previous implementation cleared documents_fts up
- * front, loaded every document body into memory via .all() inside a single
- * giant transaction, and left FTS empty on a mid-rebuild crash. The new
- * implementation:
- *   - streams source rows via .iterate() (never materializes all bodies),
- *   - builds a separate documents_fts_rebuild shadow table in batches,
+ * Covers rebuildFTSForCjkNormalization()'s batched, shadow-table rebuild
+ * (src/store.ts). The original implementation cleared documents_fts up front,
+ * loaded every document body into memory via a single unbounded .all() inside
+ * one giant transaction, and left FTS empty on a mid-rebuild crash.
+ *
+ * The row-scan strategy has since gone through two fixes for two distinct
+ * failure modes, both still enforced here:
+ *   - OOM (the original bug): never materialize every active document's body
+ *     into one JS array at once. First fixed via a streaming .iterate()
+ *     cursor; now enforced via bounded, keyset-paginated .all() batches
+ *     (`WHERE id > ? ORDER BY id LIMIT ?`) — each call materializes at most
+ *     one bounded batch, then the batch is discarded before the next SELECT.
+ *   - "database is busy" (a later regression): a better-sqlite3 .iterate()
+ *     cursor left open while a transaction begins on the same connection
+ *     raises "database is busy". Bounded LIMIT/OFFSET-style batches instead
+ *     fully finalize each SELECT before the insert transaction starts, so the
+ *     connection is never busy with two concurrent statements.
+ * Both fixes share the same shadow-table structure:
+ *   - builds a separate documents_fts_rebuild shadow table in bounded batches,
  *   - atomically swaps it in only after a complete pass,
  *   - drops a lingering shadow table from a prior crashed run on the next run.
  *
  * These tests exercise the migration through createStore()/openDatabase() on a
  * pre-seeded DB that omits the fts_cjk_normalized_version marker (forcing a
- * rebuild on open), plus a structural assertion that .iterate() — not .all() —
- * drives the body scan.
+ * rebuild on open), plus a structural assertion that the body scan is bounded
+ * (LIMIT + keyset pagination) rather than a single unbounded .all() over every
+ * active document.
  *
  * Run with: bun test test/store-cjk-fts.test.ts
  *        or: pnpm test:node test/store-cjk-fts.test.ts
@@ -134,11 +147,11 @@ function activeDocCount(db: Database): number {
 }
 
 // =============================================================================
-// Test 1 — structural: rebuild streams via .iterate(), never .all()
+// Test 1 — structural: rebuild scans source rows in bounded, paginated batches
 // =============================================================================
 
-describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
-  test("body scan uses .iterate(), not .all()", () => {
+describe("rebuildFTSForCjkNormalization — bounded source scan", () => {
+  test("body scan is bounded (keyset LIMIT pagination), never one unbounded .all()", () => {
     const __filename = fileURLToPath(import.meta.url);
     const storeSrc = readFileSync(
       join(dirname(__filename), "..", "src", "store.ts"),
@@ -155,18 +168,24 @@ describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
     const fnBodyRaw = storeSrc.slice(startIdx, endIdx);
 
     // Strip line + block comments so the assertions match real executed code,
-    // not the narrative comment that mentions the old `.all()` behavior.
+    // not narrative comments that mention old/alternate behavior.
     const fnBody = fnBodyRaw
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .split("\n")
       .map(line => line.replace(/\/\/.*$/, ""))
       .join("\n");
 
-    // The source-row scan must stream one row at a time.
-    expect(fnBody).toMatch(/\.iterate</);
-    // It must NOT pull the whole result set (every document body) into a JS
-    // array — that is the OOM regression this fix removes.
-    expect(fnBody).not.toMatch(/\.all\(/);
+    // The guarded invariant is "bounded memory", not a specific better-sqlite3
+    // API. Any .all() used for the source-body scan must be paired with a
+    // LIMIT and a keyset cursor (id > ?), so each call only ever materializes
+    // one bounded batch — never every active document's body at once (the
+    // original OOM bug) — and each SELECT fully finalizes before the insert
+    // transaction begins (the "database is busy" regression this replaced a
+    // streaming .iterate() cursor to fix, since holding a cursor open on the
+    // same connection while starting a transaction raises "busy").
+    expect(fnBody).toMatch(/LIMIT\s*\?/);
+    expect(fnBody).toMatch(/d\.id\s*>\s*\?/);
+    expect(fnBody).toMatch(/ORDER BY d\.id/);
     // Sanity: it builds into a shadow table and atomically swaps it in via
     // INSERT INTO … SELECT (not ALTER TABLE … RENAME, which triggers SQLite
     // 3.25+ re-validation of dependent trigger bodies).
@@ -229,9 +248,9 @@ describe("rebuildFTSForCjkNormalization — large-library full migration", () =>
       ).get() as { value?: string } | undefined;
       expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
 
-      // FTS rowcount equals active doc count — every active doc got indexed
-      // (crossing the BATCH_SIZE=500 boundary is fine; this is the smaller
-      // multi-batch correctness check).
+      // FTS rowcount equals active doc count — every active doc got indexed.
+      // This case is about body size (OOM), not batch count: 60 docs stay under
+      // BATCH_SIZE, so the boundary itself is covered by the 600-doc test below.
       expect(ftsRowCount(db)).toBe(activeDocCount(db));
       expect(ftsRowCount(db)).toBe(DOC_COUNT);
 
@@ -246,6 +265,61 @@ describe("rebuildFTSForCjkNormalization — large-library full migration", () =>
       ).get();
       // bun:sqlite .get() returns null, better-sqlite3 returns undefined for no-row.
       expect(shadow ?? undefined).toBeUndefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("crosses the BATCH_SIZE boundary without 'database is busy' (600 docs)", async () => {
+    // Regression guard for the busy-connection bug. The batch flush only runs
+    // mid-scan once the buffer fills, so it takes MORE than BATCH_SIZE (500)
+    // active docs to reach it — every other test here seeds far fewer and so
+    // flushed exactly once, after the scan had already finished. With a
+    // .iterate() cursor still open at that first mid-scan flush, better-sqlite3
+    // rejects the transaction's BEGIN with "This database connection is busy
+    // executing a query" and the migration dies. bun:sqlite tolerates it, which
+    // is why the bun half of the suite never saw this.
+    const DOC_COUNT = 600;
+
+    {
+      const seed = openDatabase(dbPath);
+      createBaseSchema(seed);
+      const seedAll = seed.transaction(() => {
+        for (let i = 1; i <= DOC_COUNT; i++) {
+          seedDocument(seed, {
+            id: i,
+            collection: "many",
+            path: `doc-${i}.md`,
+            title: `Document ${i}`,
+            body: `배치 경계 문서 본문 unique-token-${i}`,
+          });
+        }
+      });
+      seedAll();
+      expect(ftsRowCount(seed)).toBe(0);
+      seed.close();
+    }
+
+    // Before the fix this threw out of createStore() rather than failing an
+    // assertion below.
+    const store = createStore(dbPath);
+    try {
+      const db = store.db;
+      const ver = db.prepare(
+        `SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`
+      ).get() as { value?: string } | undefined;
+      expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
+
+      // Every batch landed — no rows dropped at a page boundary.
+      expect(ftsRowCount(db)).toBe(DOC_COUNT);
+      expect(ftsRowCount(db)).toBe(activeDocCount(db));
+
+      // Spot-check docs from the first, second, and final page.
+      for (const id of [1, 500, 501, DOC_COUNT]) {
+        const hits = store.searchFTS(`unique-token-${id}`, 10, "many");
+        expect(hits.length).toBe(1);
+        expect(hits[0]!.displayPath).toBe(`many/doc-${id}.md`);
+      }
     } finally {
       store.close();
     }
